@@ -16,11 +16,14 @@ import { Lifecycle } from './lifecycle.js';
 import { Scheduler } from './scheduler.js';
 import { ProgrammingMode } from './programming-mode.js';
 import { BackgroundTaskManager } from './background-tasks.js';
+import { SkillBatcher } from '../skills/batcher.js';
+import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
 import { formatToolStep, formatNarrative, type NarrativeStep } from '../utils/tool-label.js';
 import { getTelegramHelp } from '../utils/manual.js';
+import { WebChannel } from '../channels/web.js';
 import type { ArrowSelectOption } from '../utils/arrow-select.js';
 import { setAskUserHandler } from '../capabilities/interaction/ask-user.js';
 import type { SpotifyClient } from '../spotify/client.js';
@@ -293,6 +296,8 @@ export class Agent {
   private supervisor?: import('../core/supervisor.js').SubAgentSupervisor;
   readonly programmingMode: ProgrammingMode;
   private spotifyClient?: SpotifyClient;
+  private skillBatcher: SkillBatcher | null = null;
+  private skillLoader?: SkillLoader;
   readonly backgroundTasks: BackgroundTaskManager;
 
   constructor(
@@ -332,8 +337,18 @@ export class Agent {
     });
   }
 
+  setSkillLoader(skillLoader: SkillLoader): void {
+    this.skillLoader = skillLoader;
+    if (this.supervisor) {
+      this.skillBatcher = new SkillBatcher(this.supervisor, this.backgroundTasks);
+    }
+  }
+
   setSupervisor(supervisor: import('../core/supervisor.js').SubAgentSupervisor): void {
     this.supervisor = supervisor;
+    if (this.skillLoader) {
+      this.skillBatcher = new SkillBatcher(supervisor, this.backgroundTasks);
+    }
     supervisor.setNotifyCallback(async (channelType, channelId, message) => {
       const channel = this.channels.get(channelType as any);
       if (channel) {
@@ -802,6 +817,21 @@ export class Agent {
     return { ok: true, message: `Session model switched to **${providerName}** · **${model}**.` };
   }
 
+  /** Returns the currently active provider name and model. */
+  getCurrentProvider(): { name: string; model: string } {
+    try {
+      const p = this.providers.getDefault();
+      return { name: this.config.providers.default as string || p.name, model: p.getModel() };
+    } catch {
+      return { name: this.config.providers.default as string || 'unknown', model: '' };
+    }
+  }
+
+  /** Public wrapper for web API model switching. */
+  async switchProvider(providerName: string): Promise<{ ok: boolean; message: string }> {
+    return this.switchSessionProvider(providerName);
+  }
+
   async birth(): Promise<void> {
     this.lifecycle.transition('birthing');
     logger.info({ name: this.config.identity.name }, 'Mercury is being born...');
@@ -985,7 +1015,7 @@ export class Agent {
         if (memoryContext.context) {
           messages.push({
             role: 'user',
-            content: memoryContext.context,
+            content: `[Second Brain — auto-retrieved context]\n${memoryContext.context}\n[End auto-retrieved context]`,
           });
           messages.push({ role: 'assistant', content: 'Noted. I\'ll keep this in mind.' });
         }
@@ -1010,6 +1040,51 @@ export class Agent {
       }
 
       messages.push({ role: 'user', content: msg.content });
+
+      // ── Skill Intent Routing & Batch Execution ──
+      if (this.skillBatcher && this.skillLoader && msg.channelType !== 'internal') {
+        try {
+          const intentRouter = this.skillLoader.intentRouter;
+          if (intentRouter && intentRouter.isInitialized()) {
+            const batches = intentRouter.matchToBatches(trimmed, 0.4);
+            const totalMatchedSkills = batches.reduce((sum, b) => sum + b.skills.length, 0);
+
+            if (batches.length > 0 && totalMatchedSkills >= 1) {
+              const matchedSkillNames = batches.flatMap(b => b.skills.map(s => s.name));
+              this.markProgress(`Matched intents: ${matchedSkillNames.join(', ')}...`);
+
+              // For 2+ skills, batch execute via sub-agents
+              // For single skill, let the LLM handle it normally via use_skill
+              if (totalMatchedSkills >= 2) {
+                const plan = this.skillBatcher.planExecution(batches);
+                if (plan.batches.length > 0) {
+                  const channel = this.channels.getChannelForMessage(msg);
+                  if (channel) {
+                    await channel.send(`🧠 Intent routing matched **${totalMatchedSkills}** skills: ${matchedSkillNames.join(', ')}. Executing batch in background...`, msg.channelId).catch(() => {});
+                  }
+
+                  // Execute and wait for results
+                  const batchResults = await this.skillBatcher.execute(plan, trimmed, msg.channelId, msg.channelType);
+                  const summary = this.skillBatcher.summarizeResults(batchResults);
+
+                  if (summary) {
+                    messages.push({
+                      role: 'user',
+                      content: `[Skill Batch Execution Results]\n${summary}\n\nSynthesize a coherent response based on these results. Mention what was done, any failures, and key findings.`,
+                    });
+                    messages.push({
+                      role: 'assistant',
+                      content: 'Acknowledged. I will synthesize the batch execution results into a coherent response.',
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Intent routing / batch execution failed — continuing without it');
+        }
+      }
 
       this.lifecycle.transition('responding');
 
@@ -1040,7 +1115,7 @@ export class Agent {
         }
       }, MAX_FOREGROUND_WALL_MS);
 
-      const canStream = msg.channelType === 'cli' || (msg.channelType === 'telegram' && this.telegramStreaming);
+      const canStream = msg.channelType === 'cli' || msg.channelType === 'web' || (msg.channelType === 'telegram' && this.telegramStreaming);
 
       const tgChannel = this.channels.get('telegram');
       if (msg.channelType === 'telegram' && tgChannel) {
@@ -1224,15 +1299,29 @@ export class Agent {
                           }
                         }
                       }
+                    } else if (channel instanceof WebChannel) {
+                      const webCh = channel as WebChannel;
+                      for (const tc of toolCalls) {
+                        webCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
+                          }
+                        }
+                      }
                     } else {
                       await channel.send(`  [Using: ${names}]`, msg.channelId).catch(() => {});
                     }
                     this.markProgress();
                   }
                 } else if (toolResults === undefined || (toolCalls === undefined)) {
-                  const stepText = (toolResults as any)?.text ?? '';
-                  if (stepText) {
-                    loopDetector.recordStepText(String(stepText));
+                  const stepText_step = (toolResults as any)?.text ?? '';
+                  if (stepText_step) {
+                    loopDetector.recordStepText(String(stepText_step));
                   }
                   const noActionLoop = loopDetector.recordNoActionResult();
                   if (noActionLoop) {
@@ -1453,15 +1542,29 @@ export class Agent {
                           }
                         }
                       }
+                    } else if (channel instanceof WebChannel) {
+                      const webCh = channel as WebChannel;
+                      for (const tc of toolCalls) {
+                        webCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
+                          }
+                        }
+                      }
                     } else {
                       await channel.send(`  [Using: ${names}]`, msg.channelId).catch(() => {});
                     }
                     this.markProgress();
                   }
                 } else if (toolResults === undefined || (toolCalls === undefined)) {
-                  const stepText = (toolResults as any)?.text ?? '';
-                  if (stepText) {
-                    loopDetector.recordStepText(String(stepText));
+                  const stepText_nostream = (toolResults as any)?.text ?? '';
+                  if (stepText_nostream) {
+                    loopDetector.recordStepText(String(stepText_nostream));
                   }
                   const noActionLoop = loopDetector.recordNoActionResult();
                   if (noActionLoop) {
@@ -1488,6 +1591,9 @@ export class Agent {
           }
 
           usedProvider = { name: provider.name, model: provider.getModel() };
+          if (channel instanceof WebChannel) {
+            (channel as WebChannel).sendProviderInfo(usedProvider.name, usedProvider.model, msg.channelId);
+          }
           this.providers.markSuccess(provider.name);
           break;
         } catch (err: any) {
@@ -1622,6 +1728,10 @@ export class Agent {
           // CLI or other channels — original flow
           if (streamedText && streamedText.trim()) {
             logger.info({ channelType: msg.channelType, elapsed }, 'Streamed response completed');
+            // Web channel needs text_done after streaming to reset frontend state
+            if (channel instanceof WebChannel) {
+              await channel.send(streamedText, msg.channelId, elapsed);
+            }
           } else {
             logger.info({ channelType: msg.channelType, targetId: msg.channelId }, 'Sending response');
             await channel.send(finalText, msg.channelId, elapsed);
@@ -1695,15 +1805,33 @@ export class Agent {
 
     if (this.userMemory) {
       const summary = this.userMemory.getSummary();
-      prompt += `\n\nSecond Brain is ENABLED. You have a persistent, structured memory of ${summary.total} facts about this user.`;
+      prompt += `\n\nSecond Brain (SQLite-backed long-term memory) is ENABLED. You have ${summary.total} persistent memories about this user.`;
       prompt += `\nMemory types: identity, preference, goal, project, habit, decision, constraint, relationship, episode, reflection.`;
-      prompt += `\nRelevant memories are automatically injected before each message. You can reference them naturally (e.g. "I remember you prefer TypeScript").`;
-      prompt += `\nUsers can manage memory with: /memory (overview, search, pause learning, clear).`;
+      prompt += `\n\nCRITICAL — Memory storage rules:`;
+      prompt += `\n- ALL persistent user knowledge lives in the Second Brain SQLite database — this is the single source of truth.`;
+      prompt += `\n- NEVER use create_file, write_file, edit_file, or any file tool to store memories, notes, facts, preferences, or brain data. Files are for code and documents, not for knowledge storage.`;
+      prompt += `\n- New memories are extracted AUTOMATICALLY after each conversation turn. You do not need to ask the user if they want to save something.`;
+      prompt += `\n- When the user explicitly asks you to "save/remember/note/keep this," use the save_memory tool to store it directly — no follow-up questions needed.`;
+      prompt += `\n- When you need to actively recall something beyond auto-injected context (e.g. "do you remember...", "what do I know about..."), use the search_memory tool.`;
+      prompt += `\n- Relevant memories are auto-injected before each message. You can reference them naturally (e.g. "I remember you prefer TypeScript").`;
+      prompt += `\n- Users can manage memory with: /memory (overview, search, pause learning, clear).`;
       if (summary.learningPaused) {
-        prompt += `\nLearning is currently PAUSED — no new memories will be extracted from conversations until resumed.`;
+        prompt += `\n\nLearning is currently PAUSED — no new memories will be extracted or saved until resumed.`;
       }
     } else {
       prompt += '\n\nSecond Brain is DISABLED. Basic long-term memory (text search over facts) is still active.';
+    }
+
+    // Notification routing guidance for tweet-notifier skill
+    const skillNames = this.capabilities.getSkillContext();
+    if (skillNames.includes('tweet-notifier')) {
+      prompt += `\n\n**Tweet Notification System Available** — The tweet-notifier skill is installed.
+When you need to schedule tweets, manage approvals, or notify founders/supporters:
+1. Use the \`use_skill\` tool to invoke the \`tweet-notifier\` skill for detailed instructions
+2. The skill provides templates for scheduling tweets, notifying founders (via send_message), and alerting supporters (approved Telegram users)
+3. Key tools used by this system: schedule_task (for timing), send_message (for notifications to Telegram), save_memory (for tweet state tracking), search_memory (for checking existing tweets)
+4. Supporters are all approved Telegram users — send_message will reach them
+5. The founder (Optimus Prime) receives notifications via send_message (Telegram)`;
     }
 
     const toolNames = this.capabilities.getToolNames();
@@ -1794,7 +1922,7 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
         }
 
         const pruning = this.userMemory.prune();
-        if (pruning.activePruned > 0 || pruning.durablePruned > 0 || pruning.promoted > 0) {
+        if (pruning.movedToSubconscious > 0 || pruning.hardDeleted > 0 || pruning.promoted > 0) {
           logger.info({ pruning }, 'Second brain pruned');
         }
       } catch (err) {
@@ -1847,7 +1975,29 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
       const provider = this.providers.getDefault();
       const result = await generateText({
         model: provider.getModelInstance(),
-        system: `You extract structured memory from conversations. Read the conversation and output a JSON array of memory candidates. Each candidate has: type (one of: identity, preference, goal, project, habit, decision, constraint, relationship, episode), summary (concise fact, 12-220 chars), detail (optional longer explanation), evidenceKind (direct for explicitly stated facts, inferred for patterns you notice), confidence (0.0-1.0), importance (0.0-1.0), durability (0.0-1.0). Extract 0-3 candidates. Only extract specific, durable, user-specific information. Do NOT extract trivial observations, greetings, or assistant behavior. Output pure JSON array, no markdown.`,
+        system: `You extract structured memory from conversations. Output a JSON array of 0-3 memory candidates.
+
+Each candidate: { type, summary (concise fact, 12-220 chars), detail (optional explanation), evidenceKind ("direct" if explicitly stated, "inferred" if deduced), confidence (0-1), importance (0-1), durability (0-1) }
+
+TYPE DEFINITIONS (pick the single most specific one):
+- identity: who the user IS — their name, role, job title, self-description
+- relationship: other people the user knows — MUST include the person's name in summary
+- preference: likes, dislikes, style choices, opinions
+- goal: aspirations, targets, things they want to achieve
+- project: specific ongoing work, initiatives, things being built
+- habit: routines, recurring behaviors, schedules
+- decision: choices made, commitments, selected approaches
+- constraint: limitations, rules they follow, things they avoid
+- episode: notable one-time events worth remembering
+
+RULES:
+- Each semantic fact must appear EXACTLY ONCE. Never store the same information under multiple types.
+- If a fact is about someone else's role/relationship to the user, use "relationship" (not "identity").
+- "identity" is ONLY for the user themselves.
+- For relationships, always name the person: "Salman is user's co-developer" not "User works with a co-developer".
+- Only extract specific, durable, user-specific information.
+- Do NOT extract trivial observations, greetings, or assistant behavior.
+- Output pure JSON array, no markdown fences.`,
         messages: [
           { role: 'user', content: `User: ${userMessage}\nAssistant: ${agentResponse}` },
         ],
@@ -1878,12 +2028,15 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
 
       try {
         const jsonStr = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-        candidates = JSON.parse(jsonStr);
+        const parsed = JSON.parse(jsonStr);
+        // Handle both single object and array of objects
+        candidates = Array.isArray(parsed) ? parsed : [parsed];
       } catch {
         const facts = text
           .split('\n')
           .map(l => l.replace(/^-\s*/, '').trim())
-          .filter(f => f.length > 10 && f.length < 200);
+          // Skip JSON-like lines (key-value pairs, braces, brackets)
+          .filter(f => f.length > 10 && f.length < 200 && !/^["{\[\]}]|":\s*"/.test(f));
         candidates = facts.slice(0, 3).map(f => ({
           type: 'preference',
           summary: f,
@@ -2230,7 +2383,12 @@ Is this productive iteration or a stuck loop?`,
 
     if (cmd === '/memory') {
       if (!this.userMemory) {
-        await channel.send('Second brain is not enabled.', channelId);
+        const cfg = ctx.config();
+        if (cfg.memory.secondBrain?.enabled === false) {
+          await channel.send('Second brain is disabled in configuration.', channelId);
+        } else {
+          await channel.send('Second brain dependency issue: SQLite backend (better-sqlite3) is not available.', channelId);
+        }
         return true;
       }
 
@@ -3105,7 +3263,12 @@ Is this productive iteration or a stuck loop?`,
           if (this.userMemory) {
             await this.openCliMemoryMenu(channel, channelId, select);
           } else {
-            await channel.send('Second brain is not enabled.', channelId);
+            const cfg = ctx.config();
+            if (cfg.memory.secondBrain?.enabled === false) {
+              await channel.send('Second brain is disabled in configuration.', channelId);
+            } else {
+              await channel.send('Second brain dependency issue: SQLite backend (better-sqlite3) is not available.', channelId);
+            }
           }
           continue;
         }

@@ -102,6 +102,8 @@ export class TelegramChannel extends BaseChannel {
   }
 
   async start(): Promise<void> {
+    if (this.bot) return; // Already started — don't create a second polling instance
+
     const token = this.config.channels.telegram.botToken;
     if (!token) {
       logger.warn('Telegram bot token not set — skipping');
@@ -231,38 +233,21 @@ export class TelegramChannel extends BaseChannel {
 
     this.bot = bot;
 
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-
-      void bot.start({
-        onStart: async (info) => {
-          logger.info({ bot: info.username }, 'Telegram bot started — long polling active');
-          this.ready = true;
-          await this.registerCommands();
-          if (!settled) {
-            settled = true;
-            resolve();
-          }
-        },
-      }).catch((err: any) => {
-        if (!settled) {
-          settled = true;
-          const message = err?.description || err?.message || String(err);
-          if (err?.error_code === 401) {
-            reject(new Error(`Telegram bot token is invalid. Get a fresh token from @BotFather via /token.\n  Details: ${message}`));
-          } else if (err?.error_code === 404) {
-            reject(new Error(`Telegram bot not found — the token may be wrong or the bot was deleted. Verify with @BotFather.\n  Details: ${message}`));
-          } else if (err?.error_code === 429) {
-            reject(new Error(`Telegram is rate-limiting this bot. Wait a minute and try again.\n  Details: ${message}`));
-          } else if (err?.error_code === 403) {
-            reject(new Error(`Telegram bot lacks permission for this action. Check bot scopes with @BotFather.\n  Details: ${message}`));
-          } else {
-            reject(new Error(`Telegram bot failed to start: ${message}`));
-          }
-          return;
-        }
-        logger.error({ err: err.message }, 'Telegram bot start loop failed after startup');
-      });
+    // Start long-polling in the background.
+    // bot.start() blocks until the first getUpdates succeeds, which can take
+    // 30-40s on slow networks. Don't block Mercury startup — let it connect
+    // asynchronously. The guard on line 105 (if this.bot) prevents duplicate instances.
+    void bot.start({
+      onStart: async (info) => {
+        logger.info({ bot: info.username }, 'Telegram bot started — long polling active');
+        this.ready = true;
+        await this.registerCommands();
+      },
+    }).catch((err: any) => {
+      const message = err?.description || err?.message || String(err);
+      logger.error({ err: message }, 'Telegram bot polling stopped');
+      // Don't null out this.bot here — stop() will handle cleanup.
+      // The guard (if this.bot) prevents a second instance from being created.
     });
   }
 
@@ -873,7 +858,8 @@ export class TelegramChannel extends BaseChannel {
     const summary = this.chatCommandContext.memorySummary();
     const lines = [
       `<b>Memory Overview</b>`,
-      `Total memories: ${summary.total}`,
+      `Conscious memories: ${summary.total}`,
+      `Subconscious memories: ${summary.subconsciousTotal}`,
       `Learning: ${summary.learningPaused ? '⏸ PAUSED' : '✅ ACTIVE'}`,
     ];
     if (summary.profileSummary) {
@@ -892,8 +878,12 @@ export class TelegramChannel extends BaseChannel {
       .text('📋 Overview', `${MEMORY_ACTION_PREFIX}:overview`)
       .text('🔍 Recent', `${MEMORY_ACTION_PREFIX}:recent`)
       .row()
+      .text('💤 Subconscious', `${MEMORY_ACTION_PREFIX}:subconscious`)
       .text(learningLabel, `${MEMORY_ACTION_PREFIX}:toggle_learning`)
-      .text('🗑 Clear All', `${MEMORY_ACTION_PREFIX}:clear_confirm`);
+      .row()
+      .text('🗑 Clear All', `${MEMORY_ACTION_PREFIX}:clear_confirm`)
+      .row()
+      .text('🧠 Shared', `${MEMORY_ACTION_PREFIX}:shared`);
 
     await this.bot.api.sendMessage(chatId, lines.join('\n'), {
       parse_mode: 'HTML',
@@ -921,7 +911,8 @@ export class TelegramChannel extends BaseChannel {
       const summary = this.chatCommandContext.memorySummary();
       const lines = [
         `<b>Memory Overview</b>`,
-        `Total memories: ${summary.total}`,
+        `Conscious memories: ${summary.total}`,
+        `Subconscious memories: ${summary.subconsciousTotal}`,
         `Learning: ${summary.learningPaused ? '⏸ PAUSED' : '✅ ACTIVE'}`,
       ];
       if (summary.profileSummary) {
@@ -952,7 +943,7 @@ export class TelegramChannel extends BaseChannel {
       }
       const lines = ['<b>Recent Memories:</b>\n'];
       for (const r of recent) {
-        const scope = r.scope === 'active' ? '⏳' : '📌';
+        const scope = r.scope === 'active' ? '⏳' : r.scope === 'subconscious' ? '💤' : '📌';
         lines.push(`${scope} [${r.type}] ${this.escapeHtml(r.summary)}`);
         lines.push(`   Confidence: ${r.confidence.toFixed(2)} | Evidence: ${r.evidenceKind} | Seen: ${r.evidenceCount}x`);
       }
@@ -999,6 +990,38 @@ export class TelegramChannel extends BaseChannel {
 
     if (action === 'clear_no') {
       await ctx.answerCallbackQuery({ text: 'Cancelled' });
+      return;
+    }
+
+    if (action === 'subconscious') {
+      if (!this.chatCommandContext) {
+        await ctx.answerCallbackQuery({ text: 'Not available' });
+        return;
+      }
+      const subconsciousMemories = this.chatCommandContext.memoryGetSubconscious(5);
+      const subconsciousTotal = this.chatCommandContext.memorySummary().subconsciousTotal;
+      if (subconsciousMemories.length === 0) {
+        await this.bot.api.sendMessage(chatId, '💤 <b>Subconscious Memory</b>\n\nNo subconscious memories yet. Memories move here after 30 days of not being referenced, and are recalled automatically when relevant to a conversation.').catch(() => {});
+        return;
+      }
+      const lines = ['💤 <b>Subconscious Memory (first 5 by recency):</b>\n'];
+      for (const r of subconsciousMemories) {
+        const ageDays = Math.round((Date.now() - r.lastSeenAt) / (1000 * 60 * 60 * 24));
+        lines.push(`💤 [${r.type}] ${this.escapeHtml(r.summary)}`);
+        lines.push(`   Confidence: ${r.confidence.toFixed(2)} | Last seen: ${ageDays}d ago`);
+      }
+      if (subconsciousTotal > 5) {
+        lines.push(`\n... and ${subconsciousTotal - 5} more subconscious memories stored.`);
+      }
+      lines.push(`\n<i>These memories can be recalled to conscious when relevant to a conversation.</i>`);
+      await this.bot.api.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' }).catch(async () => {
+        await this.bot!.api.sendMessage(chatId, lines.join('\n'));
+      });
+      return;
+    }
+
+    if (action === 'shared_back') {
+      await this.sendMemoryKeyboard(chatId);
       return;
     }
 
@@ -1369,5 +1392,55 @@ export class TelegramChannel extends BaseChannel {
     } catch {
       await this.bot.api.sendMessage(chatId, content).catch(() => {});
     }
+  }
+
+  /**
+   * Send a feedback request to the admin via Telegram with inline keyboard options.
+   * Returns the user's response as a string.
+   */
+  async sendFeedbackRequest(feedbackId: string, boardName: string, cardTask: string, question: string, options?: string[]): Promise<string | null> {
+    if (!this.bot) return null;
+
+    // Find admin chat
+    const admin = this.getAdminUser();
+    if (!admin) return null;
+
+    const header = `🔔 <b>Feedback Required</b>\n\n<b>Board:</b> ${this.escapeHtml(boardName)}\n<b>Card:</b> ${this.escapeHtml(cardTask)}\n\n${this.escapeHtml(question)}`;
+
+    const keyboard = new InlineKeyboard();
+    if (options && options.length > 0) {
+      for (const opt of options) {
+        keyboard.text(opt, `feedback:${feedbackId}:${opt}`).row();
+      }
+    }
+    keyboard.text('💬 Type custom response', `feedback:${feedbackId}:__custom__`);
+
+    try {
+      await this.bot.api.sendMessage(admin.chatId, header, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      });
+    } catch {
+      try {
+        await this.bot.api.sendMessage(admin.chatId, `Feedback Required\n\nBoard: ${boardName}\nCard: ${cardTask}\n\n${question}`, {
+          reply_markup: keyboard,
+        });
+      } catch { return null; }
+    }
+    return null; // Response comes via callback_query handler
+  }
+
+  private getAdminUser(): { chatId: number } | null {
+    // Access the first admin user from approved list
+    const users = (this as any).approvedUsers as Map<number, any> | undefined;
+    if (!users) return null;
+    for (const [chatId, user] of users) {
+      if (user.role === 'admin') return { chatId };
+    }
+    // Fallback: first user
+    for (const [chatId] of users) {
+      return { chatId };
+    }
+    return null;
   }
 }

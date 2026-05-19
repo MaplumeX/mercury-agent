@@ -104,7 +104,6 @@ export interface MercuryConfig {
     shortTermMaxMessages: number;
     secondBrain: {
       enabled: boolean;
-      maxRecords: number;
     };
   };
   heartbeat: {
@@ -131,6 +130,10 @@ export interface MercuryConfig {
     accountName: string;
     accountId: string;
     product: string;
+  };
+  web: {
+    enabled: boolean;
+    port: number;
   };
 }
 
@@ -263,7 +266,6 @@ export function getDefaultConfig(): MercuryConfig {
       shortTermMaxMessages: getEnvNum('SHORT_TERM_MAX_MESSAGES', 20),
       secondBrain: {
         enabled: getEnvBool('SECOND_BRAIN_ENABLED', true),
-        maxRecords: getEnvNum('SECOND_BRAIN_MAX_RECORDS', 50),
       },
     },
     heartbeat: {
@@ -290,6 +292,10 @@ export function getDefaultConfig(): MercuryConfig {
       accountName: '',
       accountId: '',
       product: '',
+    },
+    web: {
+      enabled: getEnvBool('MERCURY_WEB_ENABLED', false),
+      port: getEnvNum('MERCURY_PORT', 6174),
     },
   };
 }
