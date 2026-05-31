@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.11 — Token Saver Mode, Skills System & Standalone Binaries
+
+The biggest release since the 1.1.x line started. Adds a full **Skill System**, a **Token Saver Mode** for cheaper sessions, **standalone binaries** for users who don't want npm, and a redesigned bottom status bar with per-step spinners.
+
+### New
+
+- **Token Saver Mode + bottom status bar overhaul + per-step spinners** (#69) — opt-in mode that aggressively trims context, plus a new persistent status bar at the bottom of the TUI showing provider/model/token usage live, with per-step spinners replacing the single global one.
+- **Skill System** (#67) — Mercury can now load and route to user-defined skills. Skills are markdown-defined behaviors that get injected on demand based on keyword/semantic match.
+- **Screenshot skill** — full website capture with viewport sizing and dark/light mode toggle.
+- **Standalone binaries + one-line installers** (#61) — `mercury` now ships as a single executable for macOS (arm64/x64), Linux (x64/arm64), and Windows (x64). No Node install required. Per-OS docs and a hero install widget on the website.
+- **Domain migration** — `mercury.cosmicstack.org` → `mercuryagent.sh`.
+- **Chinese translations** for README, ARCHITECTURE, and CHANGELOG (#53).
+
+### Fixed
+
+- **Skill ambiguity prompt** (#68) — no more 10-skill fan-out on weak matches; users get a numbered picker when the router is uncertain.
+- **Spurious ambiguity prompts on weak keyword overlap** — the matcher used to trigger the picker on incidental word overlap; now requires real signal.
+- **Release asset names aligned with published binaries** (#63) — fixes installer scripts that were pointing at the wrong filenames.
+- **Per-segment shell pattern checks** (#48) — the shell permission guard now validates each shell segment independently instead of trusting a single combined check.
+
+### Maintenance
+
+- **Removed `anonymous-file-uploader` skill** — no longer needed.
+- **`pino` upgraded** 9.14.0 → ^10.3.1 (#51).
+- Spinner polish and docs updates throughout.
+
+### Migration from 1.1.9
+
+No breaking changes. Skill system is opt-in (drop markdown files in `~/.mercury/skills/`). Token Saver Mode is off by default — enable it from the session menu or via config. Standalone binaries are an alternative install path; `npm i -g @cosmicstack/mercury-agent` keeps working exactly as before.
+
+> Note: `1.1.10` was skipped to keep numbering aligned across publish channels.
+
 ## 1.1.5 — Smoother Onboarding
 
 ### Fixed: Onboarding no longer blocks users without Ollama
