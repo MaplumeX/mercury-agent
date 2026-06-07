@@ -725,10 +725,15 @@ export class Agent {
         : '';
       const narrative = formatNarrative(this.stepNarrative, this.currentActivity, 3);
       const narrativeBlock = narrative ? `\n${narrative}` : '';
-      void channel.send(
-        `⏳ Working... ${elapsedSec}s elapsed${stepInfo}.${narrativeBlock}${handoffHint}`,
-        msg.channelId,
-      ).catch((e) => logger.warn({ e }, 'channel send failed'));
+      const heartbeatText = `⏳ Working... ${elapsedSec}s elapsed${stepInfo}.${narrativeBlock}${handoffHint}`;
+
+      // CLI: update one message in place instead of stacking new ones.
+      // Other channels (Telegram): still send as separate messages.
+      if (channel instanceof CLIChannel) {
+        (channel as CLIChannel).sendHeartbeat(heartbeatText);
+      } else {
+        void channel.send(heartbeatText, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+      }
 
       // Escalate: 20s → 30s → 45s → 60s (cap)
       if (heartbeatCount <= 2) {

@@ -87,6 +87,7 @@ export class CLIChannel extends BaseChannel {
   private permissionResolver: ((value: string | boolean) => void) | null = null;
   private menuDepth = 0;
   private menuAbortController: AbortController | null = null;
+  private heartbeatMsgId: string | null = null;
   private stepCount = 0;
   private stepStartTime = 0;
   private state: TuiState = { ...defaultState };
@@ -168,6 +169,15 @@ export class CLIChannel extends BaseChannel {
   private update(partial: Partial<TuiState>): void {
     this.state = { ...this.state, ...partial };
     this.rerender();
+  }
+
+  /** Update an existing chat message's content in place (by ID). */
+  private updateMessage(id: string, content: string, extra?: Partial<ChatMessage>): void {
+    this.update({
+      chatMessages: this.state.chatMessages.map((m) =>
+        m.id === id ? { ...m, content, timestamp: Date.now(), ...extra } : m,
+      ),
+    });
   }
 
   private rerender(): void {
@@ -358,13 +368,49 @@ export class CLIChannel extends BaseChannel {
       content,
       timestamp: Date.now(),
     };
+    // Clear any lingering heartbeat message when we send a real response.
+    if (this.heartbeatMsgId) {
+      this.state.chatMessages = this.state.chatMessages.filter((m) => m.id !== this.heartbeatMsgId);
+      this.heartbeatMsgId = null;
+    }
     this.update({
       chatMessages: [...this.state.chatMessages, msg],
       isThinking: false,
     });
   }
 
+  /**
+   * Send or replace a heartbeat progress message. First call creates a new
+   * message; subsequent calls update it in place. This avoids stacking
+   * multiple "⏳ Working..." messages in the chat history.
+   */
+  sendHeartbeat(content: string): void {
+    if (this.heartbeatMsgId) {
+      // Update existing heartbeat message in place.
+      this.updateMessage(this.heartbeatMsgId, content, { role: 'system' });
+    } else {
+      // First heartbeat — create the message.
+      const id = `heartbeat-${Date.now().toString(36)}`;
+      this.heartbeatMsgId = id;
+      const msg: ChatMessage = { id, role: 'system', content, timestamp: Date.now() };
+      this.update({
+        chatMessages: [...this.state.chatMessages, msg],
+        isThinking: true,
+      });
+    }
+  }
+
+  /** Clear the heartbeat message (called when processing completes). */
+  clearHeartbeat(): void {
+    if (this.heartbeatMsgId) {
+      this.state.chatMessages = this.state.chatMessages.filter((m) => m.id !== this.heartbeatMsgId);
+      this.heartbeatMsgId = null;
+      this.rerender();
+    }
+  }
+
   sendCompletion(elapsedMs: number, stepCount: number, meta?: CompletionMeta): void {
+    this.clearHeartbeat();
     const secs = Math.floor(elapsedMs / 1000);
     const mins = Math.floor(secs / 60);
     const remSecs = secs % 60;
@@ -450,6 +496,8 @@ export class CLIChannel extends BaseChannel {
     const msgId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     let full = '';
     let lastRender = 0;
+
+    this.clearHeartbeat();
 
     const initialMsg: ChatMessage = {
       id: msgId,
