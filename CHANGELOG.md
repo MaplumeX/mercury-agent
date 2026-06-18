@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.1.13 — Chatty Mercury
+
+Mercury gets chatty. Three new channels — Discord, Slack, and Signal — bring Mercury to where you already are, with end-to-end encryption, organization access models, and real-time streaming. Plus long-running loop fixes, CLI heartbeat improvements, and crash recovery.
+
+### New
+
+- **Discord channel** — Full bot integration with slash commands, streaming responses, rich embeds, organization access with admin roles and pairing codes, DM + channel support, and rate limiting. Config: `DISCORD_ENABLED`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`, `DISCORD_ADMIN_ROLE_NAME`, `DISCORD_STREAMING`.
+- **Slack channel** — Socket Mode bot (no public endpoint needed) with slash commands, streaming edits, organization access with admin/member roles, channel + DM support, and @mention awareness. Config: `SLACK_ENABLED`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_TEAM_ID`, `SLACK_STREAMING`.
+- **Signal channel** — End-to-end encrypted via `signal-cli` bridge. Group mode (named "Mercury" group) and private DM mode. Auto-managed `signal-cli` binary (download, register, start, health-check). Pairing-code access control. Phone number redaction in CLI output. Linux (x64/ARM64) native binaries available; macOS requires Java 17+; Windows not supported. Config: `SIGNAL_ENABLED`, `SIGNAL_PHONE_NUMBER`, `SIGNAL_MODE`, `SIGNAL_GROUP_ID`, `SIGNAL_GROUP_NAME`.
+- **Crash recovery** — New crash flag system (`~/.mercury/.crash-flag`) writes a JSON file on ungraceful exit. On next startup, Mercury reads the flag, reports what happened, and deletes it. The watchdog also writes a crash flag on max-restart exceeded, with a synchronous stderr write as last-gasp logging.
+
+### Fixed
+
+- **CLI heartbeat updates in place** — The CLI now updates the same message instead of stacking new "⏳ Working..." messages during long-running tasks. Other channels (Telegram, Discord, Slack, Signal) continue sending separate heartbeat messages.
+- **All 12 silent task failure paths eliminated** — Every loop condition, tool limit, and stall now sends an explicit error message to the channel. No more silent disappearances mid-task.
+- **Step log collapse** — Active step logs show at most 3 visible steps (running + last 2 completed). Full history available via Ctrl+D or `/log`. Idle shows compact summary line.
+- **ThinkingIndicator shows "Processing"** — Replaces agent name with a neutral label; long operations show `/bg current` hint.
+- **Ollama Local routed through OpenAI compat** — `ollamaLocal` now uses `OpenAICompatProvider` with `useChatApi: true`, bypassing the `ollama-ai-provider` v1 specification incompatibility with AI SDK v6.
+- **Daemon graceful shutdown** — `stopDaemon` is now async: sends SIGTERM, waits up to 5 seconds, escalates to SIGKILL. Stale `signal-cli` processes are cleaned up on stop.
+- **Channel send errors logged** — All `.catch(() => {})` on channel sends replaced with `.catch((e) => logger.warn({ e }, 'channel send failed'))`.
+
+### Internal
+
+- New `src/signal/` module: `binary.ts` (download/verify signal-cli), `jsonrpc.ts` (JSON-RPC client), `process.ts` (lifecycle), `setup.ts` (registration flow).
+- New `src/core/crash-flag.ts` — crash flag read/write/clear.
+- `src/types/channel.ts` — new types for Signal, Discord, Slack access models.
+- `src/utils/config.ts` — config sections, access functions, and legacy migrations for all three new channels.
+- `src/channels/registry.ts` — notification priority: Signal → Telegram → Discord → Slack → CLI.
+- `package.json` — new dependencies: `discord.js` v14, `@slack/bolt` v4.
+
+### Migration from 1.1.12
+
+No breaking changes. All new channels are **off by default** — enable via `mercury doctor` or environment variables. Existing configs, providers, threads, kanban boards, and Second Brain data carry over unchanged.
+
 ## 1.1.12 — Daemon fix for standalone binaries
 
 Hotfix on top of 1.1.11. The standalone single-file binaries shipped in 1.1.11 could not start in the background — which also meant Telegram never came online when Mercury was installed via the one-line installer (the recommended path for servers).
