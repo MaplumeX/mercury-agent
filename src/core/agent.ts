@@ -22,8 +22,11 @@ import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
+import { SignalChannel } from '../channels/signal.js';
+import { DiscordChannel } from '../channels/discord.js';
+import { SlackChannel } from '../channels/slack.js';
 import { formatToolStep, formatNarrative, type NarrativeStep } from '../utils/tool-label.js';
-import { getTelegramHelp } from '../utils/manual.js';
+import { getTelegramHelp, getDiscordHelp, getSlackHelp } from '../utils/manual.js';
 import { WebChannel } from '../channels/web.js';
 import type { ArrowSelectOption } from '../utils/arrow-select.js';
 import { setAskUserHandler } from '../capabilities/interaction/ask-user.js';
@@ -42,6 +45,22 @@ import {
   removeTelegramUser,
   saveConfig,
   getActiveProviders,
+  getDiscordAccessSummary,
+  hasDiscordAdmins,
+  findDiscordPendingRequest,
+  approveDiscordPendingRequest,
+  approveDiscordPendingRequestByPairingCode,
+  rejectDiscordPendingRequest as rejectDiscordPendingRequestConfig,
+  removeDiscordUser,
+  clearDiscordAccess,
+  getSlackAccessSummary,
+  hasSlackAdmins,
+  findSlackPendingRequest,
+  approveSlackPendingRequest,
+  approveSlackPendingRequestByPairingCode,
+  rejectSlackPendingRequest as rejectSlackPendingRequestConfig,
+  removeSlackUser,
+  clearSlackAccess,
 } from '../utils/config.js';
 
 class ToolCallLoopDetector {
@@ -784,6 +803,14 @@ export class Agent {
     if (tgCh) {
       tgCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
     }
+    const dcCh = this.channels.get('discord');
+    if (dcCh) {
+      dcCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
+    }
+    const slCh = this.channels.get('slack');
+    if (slCh) {
+      slCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
+    }
 
     this.syncBgTasksToTui();
   }
@@ -932,10 +959,11 @@ export class Agent {
           this.telegramStreaming = !this.telegramStreaming;
         }
         const ch = this.channels.get(msg.channelType as any);
+        const streamingLabel = msg.channelType === 'discord' ? 'Discord' : msg.channelType === 'slack' ? 'Slack' : 'Telegram';
         if (ch) await ch.send(
           this.telegramStreaming
-            ? 'Telegram streaming enabled. Responses will appear progressively.'
-            : 'Telegram streaming disabled. Responses will arrive as a single message.',
+            ? `${streamingLabel} streaming enabled. Responses will appear progressively.`
+            : `${streamingLabel} streaming disabled. Responses will arrive as a single message.`,
           msg.channelId,
         );
         this.lifecycle.transition('idle');
@@ -1221,12 +1249,28 @@ export class Agent {
         }
       }, MAX_FOREGROUND_WALL_MS);
 
-      const canStream = msg.channelType === 'cli' || msg.channelType === 'web' || (msg.channelType === 'telegram' && this.telegramStreaming);
+      const canStream = msg.channelType === 'cli' || msg.channelType === 'web' || (msg.channelType === 'telegram' && this.telegramStreaming) || msg.channelType === 'signal' || (msg.channelType === 'discord' && this.config.channels.discord.streaming) || (msg.channelType === 'slack' && this.config.channels.slack.streaming);
 
       const tgChannel = this.channels.get('telegram');
       if (msg.channelType === 'telegram' && tgChannel) {
         (tgChannel as TelegramChannel).resetStepCounter(msg.channelId);
         (tgChannel as TelegramChannel).beginTask(msg.channelId);
+      }
+
+      const sigChannel = this.channels.get('signal');
+      if (msg.channelType === 'signal' && sigChannel) {
+        (sigChannel as SignalChannel).resetStepCounter(msg.channelId);
+        (sigChannel as SignalChannel).beginTask(msg.channelId);
+      }
+
+      const dcChannel = this.channels.get('discord');
+      if (msg.channelType === 'discord' && dcChannel) {
+        (dcChannel as DiscordChannel).beginTask(msg.channelId);
+      }
+
+      const slChannel = this.channels.get('slack');
+      if (msg.channelType === 'slack' && slChannel) {
+        (slChannel as SlackChannel).beginTask(msg.channelId);
       }
 
       // Saver-mode-aware request limits. When saver is off these resolve to
@@ -1411,6 +1455,20 @@ export class Agent {
                           }
                         }
                       }
+                    } else if (channel instanceof SignalChannel) {
+                      const sigCh = channel as SignalChannel;
+                      for (const tc of toolCalls) {
+                        void sigCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await sigCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
                     } else if (channel instanceof WebChannel) {
                       const webCh = channel as WebChannel;
                       for (const tc of toolCalls) {
@@ -1422,6 +1480,34 @@ export class Agent {
                           const tcName = toolCalls[i]?.toolName as string | undefined;
                           if (tcName) {
                             webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
+                          }
+                        }
+                      }
+                    } else if (channel instanceof DiscordChannel) {
+                      const dcCh = channel as DiscordChannel;
+                      for (const tc of toolCalls) {
+                        void dcCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await dcCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
+                    } else if (channel instanceof SlackChannel) {
+                      const slCh = channel as SlackChannel;
+                      for (const tc of toolCalls) {
+                        slCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await slCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
                           }
                         }
                       }
@@ -1654,6 +1740,20 @@ export class Agent {
                           }
                         }
                       }
+                    } else if (channel instanceof SignalChannel) {
+                      const sigCh = channel as SignalChannel;
+                      for (const tc of toolCalls) {
+                        void sigCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await sigCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
                     } else if (channel instanceof WebChannel) {
                       const webCh = channel as WebChannel;
                       for (const tc of toolCalls) {
@@ -1665,6 +1765,34 @@ export class Agent {
                           const tcName = toolCalls[i]?.toolName as string | undefined;
                           if (tcName) {
                             webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
+                          }
+                        }
+                      }
+                    } else if (channel instanceof DiscordChannel) {
+                      const dcCh = channel as DiscordChannel;
+                      for (const tc of toolCalls) {
+                        void dcCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await dcCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
+                    } else if (channel instanceof SlackChannel) {
+                      const slCh = channel as SlackChannel;
+                      for (const tc of toolCalls) {
+                        slCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            await slCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
                           }
                         }
                       }
@@ -1745,6 +1873,15 @@ export class Agent {
           if (channel instanceof TelegramChannel) {
             (channel as TelegramChannel).endTask(msg.channelId);
             (channel as TelegramChannel).resetStepCounter(msg.channelId);
+          } else if (channel instanceof SignalChannel) {
+            (channel as SignalChannel).endTask(msg.channelId);
+            (channel as SignalChannel).resetStepCounter(msg.channelId);
+          } else if (channel instanceof DiscordChannel) {
+            (channel as DiscordChannel).endTask(msg.channelId);
+            (channel as DiscordChannel).resetStepCounter(msg.channelId);
+          } else if (channel instanceof SlackChannel) {
+            (channel as SlackChannel).endTask(msg.channelId);
+            (channel as SlackChannel).resetStepCounter(msg.channelId);
           }
           await channel.send(errMsg, msg.channelId);
         }
@@ -1853,6 +1990,79 @@ export class Agent {
             (channel as TelegramChannel).resetStepCounter(msg.channelId);
           }
           this.markProgress();
+        } else if (channel instanceof SignalChannel) {
+          // For Signal tasks: end task, flush deferred, send completion banner for substantial tasks
+          const sigCh = channel as SignalChannel;
+          if (isSubstantialTask) {
+            const completionMeta = {
+              provider: usedProvider?.name ?? 'unknown',
+              model: usedProvider?.model ?? 'unknown',
+              inputTokens: result.usage?.inputTokens ?? 0,
+              outputTokens: result.usage?.outputTokens ?? 0,
+              totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+              budgetUsed: this.tokenBudget.getDailyUsed(),
+              budgetTotal: this.tokenBudget.getBudget(),
+              budgetPercentage: this.tokenBudget.getUsagePercentage(),
+            };
+            await sigCh.sendCompletion(elapsed, stepCount, msg.channelId, completionMeta);
+          } else {
+            sigCh.endTask(msg.channelId);
+            const deferred = sigCh.popDeferredResponse(msg.channelId);
+            const responseText = deferred || (!streamedText && finalText ? finalText : null);
+            if (responseText && responseText.trim()) {
+              await channel.send(responseText, msg.channelId, elapsed);
+            }
+            sigCh.resetStepCounter(msg.channelId);
+            this.markProgress();
+          }
+        } else if (channel instanceof DiscordChannel) {
+          const dcCh = channel as DiscordChannel;
+          if (isSubstantialTask) {
+            const completionMeta = {
+              provider: usedProvider?.name ?? 'unknown',
+              model: usedProvider?.model ?? 'unknown',
+              inputTokens: result.usage?.inputTokens ?? 0,
+              outputTokens: result.usage?.outputTokens ?? 0,
+              totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+              budgetUsed: this.tokenBudget.getDailyUsed(),
+              budgetTotal: this.tokenBudget.getBudget(),
+              budgetPercentage: this.tokenBudget.getUsagePercentage(),
+            };
+            await dcCh.sendCompletion(elapsed, stepCount, msg.channelId, completionMeta);
+          } else {
+            dcCh.endTask(msg.channelId);
+            const deferred = dcCh.popDeferredResponse(msg.channelId);
+            const responseText = deferred || (!streamedText && finalText ? finalText : null);
+            if (responseText && responseText.trim()) {
+              await channel.send(responseText, msg.channelId, elapsed);
+            }
+            dcCh.resetStepCounter(msg.channelId);
+            this.markProgress();
+          }
+        } else if (channel instanceof SlackChannel) {
+          const slCh = channel as SlackChannel;
+          if (isSubstantialTask) {
+            const completionMeta = {
+              provider: usedProvider?.name ?? 'unknown',
+              model: usedProvider?.model ?? 'unknown',
+              inputTokens: result.usage?.inputTokens ?? 0,
+              outputTokens: result.usage?.outputTokens ?? 0,
+              totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+              budgetUsed: this.tokenBudget.getDailyUsed(),
+              budgetTotal: this.tokenBudget.getBudget(),
+              budgetPercentage: this.tokenBudget.getUsagePercentage(),
+            };
+            await slCh.sendCompletion(elapsed, stepCount, msg.channelId, completionMeta);
+          } else {
+            slCh.endTask(msg.channelId);
+            const deferred = slCh.popDeferredResponse(msg.channelId);
+            const responseText = deferred || (!streamedText && finalText ? finalText : null);
+            if (responseText && responseText.trim()) {
+              await channel.send(responseText, msg.channelId, elapsed);
+            }
+            slCh.resetStepCounter(msg.channelId);
+            this.markProgress();
+          }
         } else {
           // CLI or other channels — original flow
           if (streamedText && streamedText.trim()) {
@@ -2765,7 +2975,7 @@ Is this productive iteration or a stuck loop?`,
     if (!ctx) return false;
 
     if (cmd === '/help') {
-      const helpText = channelType === 'telegram' ? getTelegramHelp() : ctx.manual();
+      const helpText = channelType === 'telegram' ? getTelegramHelp() : channelType === 'discord' ? getDiscordHelp() : channelType === 'slack' ? getSlackHelp() : ctx.manual();
       await channel.send(helpText, channelId);
       return true;
     }
@@ -2832,6 +3042,10 @@ Is this productive iteration or a stuck loop?`,
         `Provider: ${config.providers.default}`,
         `Telegram: ${config.channels.telegram.enabled ? 'enabled' : 'disabled'}`,
         `Telegram access: ${getTelegramAccessSummary(config)}`,
+        `Discord: ${config.channels.discord.enabled ? 'enabled' : 'disabled'}`,
+        `Discord access: ${getDiscordAccessSummary(config)}`,
+        `Slack: ${config.channels.slack.enabled ? 'enabled' : 'disabled'}`,
+        `Slack access: ${getSlackAccessSummary(config)}`,
         `Budget: ${budget.getStatusText()}`,
         saverLine,
         `Skills: ${ctx.skillNames().length > 0 ? ctx.skillNames().join(', ') : 'none'}`,
@@ -3109,6 +3323,298 @@ Is this productive iteration or a stuck loop?`,
 
       await channel.send(
       `Unknown Telegram command "${action}". Try \`/telegram\`, \`/telegram pending\`, or \`/telegram users\`.`,
+        channelId,
+      );
+      return true;
+    }
+
+    if (cmd.startsWith('/discord')) {
+      if (channelType !== 'cli') {
+        await channel.send('`/discord` is only available from the Mercury CLI chat.', channelId);
+        return true;
+      }
+
+      const config = ctx.config();
+      const rawSubcommand = trimmed.slice('/discord'.length).trim();
+      const parts = rawSubcommand.split(/\s+/).filter(Boolean);
+      const action = parts[0]?.toLowerCase() || 'help';
+      const formatDiscordUser = (user: {
+        userId: string;
+        username?: string;
+        displayName?: string;
+        pairingCode?: string;
+      }) => {
+        const username = user.username ? ` (@${user.username})` : '';
+        const displayName = user.displayName ? ` ${user.displayName}` : '';
+        const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
+        return `${user.userId}${username}${displayName}${pairingCode}`;
+      };
+
+      const sendDiscordOverview = async () => {
+        const lines = [
+          '**Discord Management**',
+          '',
+          `Access: ${getDiscordAccessSummary(config)}`,
+          `Admins: ${config.channels.discord.admins.length > 0 ? config.channels.discord.admins.map(formatDiscordUser).join(', ') : 'none'}`,
+          `Members: ${config.channels.discord.members.length > 0 ? config.channels.discord.members.map(formatDiscordUser).join(', ') : 'none'}`,
+          `Pending: ${config.channels.discord.pending.length > 0 ? config.channels.discord.pending.map(formatDiscordUser).join(', ') : 'none'}`,
+          '',
+          'Commands:',
+          '\u2022 `/discord pending`',
+          '\u2022 `/discord users`',
+          '\u2022 `/discord approve <pairing-code|user-id>`',
+          '\u2022 `/discord reject <user-id>`',
+          '\u2022 `/discord remove <user-id>`',
+          '\u2022 `/discord reset`',
+        ];
+        await channel.send(lines.join('\n'), channelId);
+      };
+
+      if (action === 'help' || action === 'status') {
+        await sendDiscordOverview();
+        return true;
+      }
+
+      if (action === 'pending') {
+        const pending = config.channels.discord.pending;
+        const lines = [
+          '**Discord Pending Requests**',
+          '',
+          pending.length > 0 ? pending.map(formatDiscordUser).join('\n') : 'No pending Discord requests.',
+        ];
+        await channel.send(lines.join('\n'), channelId);
+        return true;
+      }
+
+      if (action === 'users') {
+        const lines = [
+          '**Discord Approved Users**',
+          '',
+          `Admins: ${config.channels.discord.admins.length > 0 ? config.channels.discord.admins.map(formatDiscordUser).join(', ') : 'none'}`,
+          `Members: ${config.channels.discord.members.length > 0 ? config.channels.discord.members.map(formatDiscordUser).join(', ') : 'none'}`,
+          '',
+          `Total approved: ${config.channels.discord.admins.length + config.channels.discord.members.length}`,
+        ];
+        await channel.send(lines.join('\n'), channelId);
+        return true;
+      }
+
+      if (action === 'approve') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/discord approve <pairing-code|user-id>`', channelId);
+          return true;
+        }
+
+        let approved = approveDiscordPendingRequestByPairingCode(config, value);
+        let resultLabel = value;
+
+        if (!approved) {
+          approved = approveDiscordPendingRequest(config, value, 'member');
+          resultLabel = value;
+        }
+
+        if (!approved) {
+          await channel.send(`No pending Discord request found for \`${resultLabel}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Approved Discord user ${formatDiscordUser(approved)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'reject') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/discord reject <user-id>`', channelId);
+          return true;
+        }
+
+        const rejected = rejectDiscordPendingRequestConfig(config, value);
+        if (!rejected) {
+          await channel.send(`No pending Discord request found for \`${value}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Rejected Discord request for ${formatDiscordUser(rejected)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'remove') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/discord remove <user-id>`', channelId);
+          return true;
+        }
+
+        const removed = removeDiscordUser(config, value);
+        if (!removed) {
+          await channel.send(`No approved Discord user found for \`${value}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Removed Discord access for ${formatDiscordUser(removed)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'reset' || action === 'unpair') {
+        clearDiscordAccess(config);
+        saveConfig(config);
+        await channel.send('Discord access reset. New users can send /start in a DM to begin pairing again.', channelId);
+        return true;
+      }
+
+      await channel.send(
+        `Unknown Discord command "${action}". Try \`/discord\`, \`/discord pending\`, or \`/discord users\`.`,
+        channelId,
+      );
+      return true;
+    }
+
+    if (cmd.startsWith('/slack')) {
+      if (channelType !== 'cli') {
+        await channel.send('`/slack` is only available from the Mercury CLI chat.', channelId);
+        return true;
+      }
+
+      const config = ctx.config();
+      const rawSubcommand = trimmed.slice('/slack'.length).trim();
+      const parts = rawSubcommand.split(/\s+/).filter(Boolean);
+      const action = parts[0]?.toLowerCase() || 'help';
+      const formatSlackUser = (user: {
+        userId: string;
+        userName?: string;
+        displayName?: string;
+        pairingCode?: string;
+      }) => {
+        const userName = user.userName ? ` (@${user.userName})` : '';
+        const displayName = user.displayName ? ` ${user.displayName}` : '';
+        const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
+        return `${user.userId}${userName}${displayName}${pairingCode}`;
+      };
+
+      const sendSlackOverview = async () => {
+        const lines = [
+          '**Slack Management**',
+          '',
+          `Access: ${getSlackAccessSummary(config)}`,
+          `Admins: ${config.channels.slack.admins.length > 0 ? config.channels.slack.admins.map(formatSlackUser).join(', ') : 'none'}`,
+          `Members: ${config.channels.slack.members.length > 0 ? config.channels.slack.members.map(formatSlackUser).join(', ') : 'none'}`,
+          `Pending: ${config.channels.slack.pending.length > 0 ? config.channels.slack.pending.map(formatSlackUser).join(', ') : 'none'}`,
+          '',
+          'Commands:',
+          '\u2022 `/slack pending`',
+          '\u2022 `/slack users`',
+          '\u2022 `/slack approve <pairing-code|user-id>`',
+          '\u2022 `/slack reject <user-id>`',
+          '\u2022 `/slack remove <user-id>`',
+          '\u2022 `/slack reset`',
+        ];
+        await channel.send(lines.join('\n'), channelId);
+      };
+
+      if (action === 'help' || action === 'status') {
+        await sendSlackOverview();
+        return true;
+      }
+
+      if (action === 'pending') {
+        const pending = config.channels.slack.pending;
+        const lines = [
+          '**Slack Pending Requests**',
+          '',
+          pending.length > 0 ? pending.map(formatSlackUser).join('\n') : 'No pending Slack requests.',
+        ];
+        await channel.send(lines.join('\n'), channelId);
+        return true;
+      }
+
+      if (action === 'users') {
+        const lines = [
+          '**Slack Approved Users**',
+          '',
+          `Admins: ${config.channels.slack.admins.length > 0 ? config.channels.slack.admins.map(formatSlackUser).join(', ') : 'none'}`,
+          `Members: ${config.channels.slack.members.length > 0 ? config.channels.slack.members.map(formatSlackUser).join(', ') : 'none'}`,
+          '',
+          `Total approved: ${config.channels.slack.admins.length + config.channels.slack.members.length}`,
+        ];
+        await channel.send(lines.join('\n'), channelId);
+        return true;
+      }
+
+      if (action === 'approve') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/slack approve <pairing-code|user-id>`', channelId);
+          return true;
+        }
+
+        let approved = approveSlackPendingRequestByPairingCode(config, value);
+        let resultLabel = value;
+
+        if (!approved) {
+          approved = approveSlackPendingRequest(config, value, 'member');
+          resultLabel = value;
+        }
+
+        if (!approved) {
+          await channel.send(`No pending Slack request found for \`${resultLabel}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Approved Slack user ${formatSlackUser(approved)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'reject') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/slack reject <user-id>`', channelId);
+          return true;
+        }
+
+        const rejected = rejectSlackPendingRequestConfig(config, value);
+        if (!rejected) {
+          await channel.send(`No pending Slack request found for \`${value}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Rejected Slack request for ${formatSlackUser(rejected)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'remove') {
+        const value = parts[1];
+        if (!value) {
+          await channel.send('Usage: `/slack remove <user-id>`', channelId);
+          return true;
+        }
+
+        const removed = removeSlackUser(config, value);
+        if (!removed) {
+          await channel.send(`No approved Slack user found for \`${value}\`.`, channelId);
+          return true;
+        }
+
+        saveConfig(config);
+        await channel.send(`Removed Slack access for ${formatSlackUser(removed)}.`, channelId);
+        return true;
+      }
+
+      if (action === 'reset' || action === 'unpair') {
+        clearSlackAccess(config);
+        saveConfig(config);
+        await channel.send('Slack access reset. New users can send /mercury start in a DM to begin pairing again.', channelId);
+        return true;
+      }
+
+      await channel.send(
+        `Unknown Slack command "${action}". Try \`/slack\`, \`/slack pending\`, or \`/slack users\`.`,
         channelId,
       );
       return true;

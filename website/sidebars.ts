@@ -47,6 +47,9 @@ const sidebars: SidebarsConfig = {
         'integrations/kanban-boards',
         'integrations/github-companion',
         'integrations/telegram',
+        'integrations/discord',
+        'integrations/slack',
+        'integrations/signal',
         'integrations/spotify',
         'integrations/coding-workspace',
         'integrations/sub-agents',
@@ -73,6 +76,7 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'releases/releases',
+        'releases/1.1.13',
         'releases/1.1.12',
         'releases/1.1.11',
         'releases/1.1.9',

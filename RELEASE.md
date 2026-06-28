@@ -1,33 +1,37 @@
-# Release v1.1.12
+# Release v1.1.13
 
-## ☿ Mercury Agent v1.1.12 — Daemon hotfix
+## ☿ Mercury Agent v1.1.13 — Chatty Mercury
 
-Hotfix on top of [v1.1.11](https://github.com/cosmicstack-labs/mercury-agent/releases/tag/v1.1.11). The standalone single-file binaries introduced in 1.1.11 could not start in the background — which meant Telegram never came online for anyone who installed Mercury via the one-line installer (the recommended path for web servers).
+Three new channels — Discord, Slack, and Signal — bring Mercury to where you already are. Every new channel has its own access model (pairing codes, admin roles, member approval), streaming responses, and real-time task progress. Signal adds end-to-end encryption for the privacy-first crowd.
 
-### What Was Broken
+Beyond channels, this release fixes the long-running cycle problem — the silent task failures that could make Mercury disappear mid-task. The CLI now updates heartbeats in-place instead of stacking new messages, step logs collapse to 3 lines (Ctrl+D for full history), and a crash flag system means Mercury tells you what happened when it restarts after an ungraceful exit.
 
-`src/cli/daemon.ts` spawned the daemon child as:
+### What's New
 
-```
-spawn(process.execPath, [process.argv[1], 'start', '--daemon'], ...)
-```
-
-- **npm install:** resolved to `node dist/index.js start --daemon` ✅
-- **Standalone binary** (`bun build --compile`): resolved to `mercury "/$bunfs/root/.../index.js" start --daemon` — Commander treated the bun-virtual path as an unknown subcommand, the child exited immediately, and `channels.startAll()` (the only place Telegram's `bot.start()` runs in daemon mode) was never reached.
-
-`mercury service install` had the same flaw and was persisting that broken command into the LaunchAgent plist / systemd unit / Task Scheduler entry, so the failure also survived reboots.
+- **Discord** — Full bot integration with slash commands, streaming responses, rich embeds, organization access with admin roles and pairing codes, DM + channel support, and rate limiting.
+- **Slack** — Socket Mode bot (no public endpoint needed) with slash commands, streaming edits, organization access with admin/member roles, channel + DM support, and @mention awareness.
+- **Signal** — End-to-end encrypted via signal-cli bridge. Group and private modes. Auto-managed signal-cli binary. Pairing-code access control. Phone number redaction in CLI.
+- **Crash recovery** — Crash flag system writes to `~/.mercury/.crash-flag` on ungraceful exit; next startup reports what happened.
 
 ### Fixed
 
-- **Daemon now spawns correctly from both install paths** — new `isStandaloneBinary()` detection in `src/cli/daemon.ts` chooses between `[node, script, 'start', '--daemon']` (npm) and `[mercury, 'start', '--daemon']` (standalone binary). Detection looks at `process.versions.bun`, `$bunfs` / `~BUN` markers in `argv[1]`, and the `execPath` basename, so `node`, `bun <script>` (dev), and standalone `mercury` all do the right thing.
-- **System-service files generated correctly for standalone installs** — macOS LaunchAgent `ProgramArguments`, Linux systemd `ExecStart=`, and Windows `schtasks /tr` now use the binary-only invocation when running from a compiled binary.
-- **Telegram comes online again in background mode** — direct consequence of the daemon fix.
+- **CLI heartbeat updates in place** — No more wall-of-progress messages during long tasks.
+- **All 12 silent task failure paths eliminated** — Every loop condition, tool limit, and stall now sends an explicit error message.
+- **Step log collapse** — Max 3 visible steps during active tasks; Ctrl+D for full history.
+- **Ollama Local routed through OpenAI compat** — Fixes AI SDK v1 specification error.
+- **Daemon graceful shutdown** — SIGTERM → wait → SIGKILL; stale signal-cli cleanup on stop.
+- **Channel send errors logged** — No more silently swallowed send failures.
+
+### Dependencies
+
+- `discord.js` v14.26.4
+- `@slack/bolt` v4.7.3
 
 ### Upgrade
 
 **npm:**
 ```
-npm install -g @cosmicstack/mercury-agent@1.1.12
+npm install -g @cosmicstack/mercury-agent@1.1.13
 mercury restart
 ```
 
@@ -36,23 +40,28 @@ mercury restart
 mercury restart
 ```
 
-If you had `mercury service install` set up under 1.1.11 (so the broken command got written into your service file), reinstall it:
-```
-mercury service uninstall
-mercury service install
-```
-
-### Verifying The Fix
-
-```
-mercury start
-mercury status      # should show a live PID
-mercury logs        # should show "Mercury is live (daemon mode)" and Telegram polling
-```
+No config migrations needed. All new channels are off by default.
 
 ### Files Touched
 
-- `src/cli/daemon.ts` — `isStandaloneBinary()` + `buildDaemonSpawnArgs()`; `ensureDaemonRunning()` uses them.
-- `src/cli/service.ts` — `getServiceLaunchArgs()` wired into macOS / Linux / Windows installers.
+- `src/channels/discord.ts` — Discord channel (new)
+- `src/channels/signal.ts` — Signal channel (new)
+- `src/channels/slack.ts` — Slack channel (new)
+- `src/signal/binary.ts` — signal-cli binary management (new)
+- `src/signal/jsonrpc.ts` — JSON-RPC client (new)
+- `src/signal/process.ts` — Process lifecycle (new)
+- `src/signal/setup.ts` — Signal registration (new)
+- `src/core/crash-flag.ts` — Crash flag system (new)
+- `src/core/agent.ts` — Channel registration, heartbeat in-place, silent failure elimination
+- `src/channels/registry.ts` — Discord/Slack/Signal registration
+- `src/channels/cli.ts` — sendHeartbeat method
+- `src/types/channel.ts` — Signal/Discord/Slack access types
+- `src/utils/config.ts` — Config sections and access management for new channels
+- `src/index.ts` — CLI commands for new channels, onboarding flows
+- `src/cli/daemon.ts` — Graceful shutdown, signal-cli cleanup
+- `src/cli/watchdog.ts` — Crash flag on max-restart
+- `src/providers/registry.ts` — ollamaLocal → OpenAI compat
+- `src/ui/App.tsx` — Step collapse, Ctrl+D, Processing indicator
+- `package.json` — v1.1.13, discord.js, @slack/bolt
 
-**Full Changelog**: https://github.com/cosmicstack-labs/mercury-agent/compare/v1.1.11...v1.1.12
+**Full Changelog**: https://github.com/cosmicstack-labs/mercury-agent/compare/v1.1.12...v1.1.13

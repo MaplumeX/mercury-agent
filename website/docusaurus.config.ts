@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Mercury Agent — Soul-driven',
-  tagline: 'Soul-driven AI agent with Second Brain memory, permission-hardened tools, and a Skill System. Runs 24/7 from CLI, Web, or Telegram.',
+  tagline: 'Soul-driven AI agent with Second Brain memory, permission-hardened tools, and a Skill System. Runs 24/7 from CLI, Web, Telegram, Discord, Slack, or Signal.',
   favicon: 'img/favicon.svg',
 
   future: {
@@ -91,7 +91,7 @@ const config: Config = {
       },
       items: [
         {to: '/docs', label: 'Docs', position: 'left'},
-        {to: '/docs/releases/1.1.12', label: 'Releases', position: 'left'},
+        {to: '/docs/releases/1.1.13', label: 'Releases', position: 'left'},
         {
           href: 'https://github.com/cosmicstack-labs/mercury-agent',
           label: 'GitHub',
